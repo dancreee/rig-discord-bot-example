@@ -1,0 +1,13 @@
+# Environment variables
+.env
+
+# Rust build directory
+/target/
+
+# macOS specific files
+.DS_Store
+
+# Debug symbols
+*.pdb
+
+/chat_histories/

@@ -1,11 +1,12 @@
 // main.rs
 
 mod rig_agent;
+mod chat_history;
 
 use anyhow::Result;
 use serenity::async_trait;
 use serenity::model::application::command::Command;
-use serenity::model::application::interaction::{Interaction, InteractionResponseType};
+use serenity::model::application::interaction::Interaction;
 use serenity::model::gateway::Ready;
 use serenity::model::channel::Message;
 use serenity::prelude::*;
@@ -33,6 +34,13 @@ impl EventHandler for Handler {
         debug!("Received an interaction");
         if let Interaction::ApplicationCommand(command) = interaction {
             debug!("Received command: {}", command.data.name);
+
+            // Immediately acknowledge the interaction
+            if let Err(e) = command.defer(&ctx.http).await {
+                error!("Failed to defer response: {:?}", e);
+                return;
+            }
+
             let content = match command.data.name.as_str() {
                 "hello" => "Hello! I'm your helpful Rust and Rig-powered assistant. How can I assist you today?".to_string(),
                 "ask" => {
@@ -44,7 +52,7 @@ impl EventHandler for Handler {
                         .and_then(|v| v.as_str())
                         .unwrap_or("What would you like to ask?");
                     debug!("Query: {}", query);
-                    match self.rig_agent.process_message(query).await {
+                    match self.rig_agent.process_message(&command.user.id.to_string(), query).await {
                         Ok(response) => response,
                         Err(e) => {
                             error!("Error processing request: {:?}", e);
@@ -57,17 +65,35 @@ impl EventHandler for Handler {
 
             debug!("Sending response: {}", content);
 
-            if let Err(why) = command
-                .create_interaction_response(&ctx.http, |response| {
-                    response
-                        .kind(InteractionResponseType::ChannelMessageWithSource)
-                        .interaction_response_data(|message| message.content(content))
-                })
-                .await
-            {
-                error!("Cannot respond to slash command: {}", why);
+        // Split message if it's too long (Discord limit is 2000 characters)
+        if content.len() > 2000 {
+            // Send first part as edit to original response
+            if let Err(why) = command.edit_original_interaction_response(&ctx.http, |response| {
+                response.content(content[..1997].to_string() + "...")
+            }).await {
+                error!("Cannot send first part of response: {:?}", why);
+                return;
+            }
+
+            // Send remaining content as follow-up messages
+            let remaining = content[1997..].to_string();
+            for chunk in remaining.chars().collect::<Vec<char>>().chunks(2000) {
+                let chunk_content: String = chunk.iter().collect();
+                if let Err(why) = command.create_followup_message(&ctx.http, |message| {
+                    message.content(chunk_content)
+                }).await {
+                    error!("Cannot send follow-up chunk: {:?}", why);
+                }
+            }
+        } else {
+            // Send as normal if content is within limits
+            if let Err(why) = command.edit_original_interaction_response(&ctx.http, |response| {
+                response.content(content)
+            }).await {
+                error!("Cannot send follow-up response: {:?}", why);
             } else {
                 debug!("Response sent successfully");
+                }
             }
         }
     }
@@ -87,7 +113,7 @@ impl EventHandler for Handler {
 
                 debug!("Processed content after removing mention: {}", content);
 
-                match self.rig_agent.process_message(&content).await {
+                match self.rig_agent.process_message(&msg.author.id.to_string(), &content).await {
                     Ok(response) => {
                         if let Err(why) = msg.channel_id.say(&ctx.http, response).await {
                             error!("Error sending message: {:?}", why);

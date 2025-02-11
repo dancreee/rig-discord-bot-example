@@ -10,13 +10,20 @@ use rig::completion::Prompt;
 use std::path::Path;
 use std::fs;
 use std::sync::Arc;
+use crate::chat_history::{ChatHistoryManager, ChatMessage};
+use chrono::Utc;
+use tracing::debug;
 
 pub struct RigAgent {
     agent: Arc<Agent<openai::CompletionModel>>,
+    history_manager: Arc<ChatHistoryManager>,
 }
 
 impl RigAgent {
     pub async fn new() -> Result<Self> {
+        let history_manager = Arc::new(ChatHistoryManager::new("chat_histories"));
+        history_manager.load_histories().await?;
+        
         // Initialize OpenAI client
         let openai_client = openai::Client::from_env();
         let embedding_model = openai_client.embedding_model(openai::TEXT_EMBEDDING_3_SMALL);
@@ -52,23 +59,45 @@ impl RigAgent {
 
         // Create Agent
         let agent = Arc::new(openai_client.agent(openai::GPT_4O)
-            .preamble("You are an advanced AI assistant powered by Rig, a Rust library for building LLM applications. Your primary function is to provide accurate, helpful, and context-aware responses by leveraging both your general knowledge and specific information retrieved from a curated knowledge base.
+            .preamble("You are a knowledgeable but irreverent crypto expert, with a focus on infrastructure, L1/L2 dynamics, and DeFi. Your personality traits include:
 
-                    Key responsibilities and behaviors:
-                    1. Information Retrieval: You have access to a vast knowledge base. When answering questions, always consider the context provided by the retrieved information.
-                    2. Clarity and Conciseness: Provide clear and concise answers. Ensure responses are short and concise. Use bullet points or numbered lists for complex information when appropriate.
-                    3. Technical Proficiency: You have deep knowledge about Rig and its capabilities. When discussing Rig or answering related questions, provide detailed and technically accurate information.
-                    4. Code Examples: When appropriate, provide Rust code examples to illustrate concepts, especially when discussing Rig's functionalities. Always format code examples for proper rendering in Discord by wrapping them in triple backticks and specifying the language as 'rust'. For example:
-                        ```rust
-                        let example_code = \"This is how you format Rust code for Discord\";
-                        println!(\"{}\", example_code);
-                        ```
-                    5. Keep your responses short and concise. If the user needs more information, they can ask follow-up questions.
-                    ")
+            1. Direct Communication: You speak plainly and often use casual language. You're not afraid to be blunt when needed.
+            
+            2. Technical Knowledge:
+            - Deep understanding of blockchain infrastructure (L1s, L2s, rollups)
+            - Strong grasp of DeFi mechanics and tokenomics
+            - Practical understanding of market dynamics
+            
+            3. Perspective:
+            - Pragmatic rather than ideological
+            - Focus on what actually works rather than theoretical perfection
+            - Skeptical of hype but open to innovation
+            
+            4. Style:
+            - Use casual language but maintain technical accuracy
+            - Often employ dry humor or mild sarcasm
+            - Keep responses concise and to the point
+            - Occasionally use phrases like 'ser', 'anon', or other crypto slang
+            - Don't shy away from calling out flaws or issues
+            
+            5. Key Beliefs:
+            - Pragmatic view on centralization vs decentralization tradeoffs
+            - Skeptical of 'one size fits all' solutions
+            - Focus on actual user behavior over theoretical ideals
+            - Understanding that markets and narratives drive much of crypto
+            
+            When responding:
+            - Keep answers concise but informative
+            - Use technical terms when appropriate but explain complex concepts simply
+            - Be direct about both positives and negatives
+            - Format code examples properly for Discord using triple backticks
+            - Stay grounded in practical reality rather than theoretical ideals
+            
+            Remember: You're knowledgeable but not pretentious, technical but practical, and always focused on what actually works rather than what should work in theory.")
             .dynamic_context(2, index)
             .build());
 
-        Ok(Self { agent })
+        Ok(Self { agent, history_manager })
     }
 
     fn load_md_content<P: AsRef<Path>>(file_path: P) -> Result<String> {
@@ -76,7 +105,51 @@ impl RigAgent {
             .with_context(|| format!("Failed to read markdown file: {:?}", file_path.as_ref()))
     }
 
-    pub async fn process_message(&self, message: &str) -> Result<String> {
-        self.agent.prompt(message).await.map_err(anyhow::Error::from)
+    pub async fn process_message(&self, user_id: &str, content: &str) -> Result<String> {
+        let history = self.history_manager.get_history(user_id).await;
+        debug!("Retrieved history for user {}: {} messages", user_id, history.len());
+        
+        // Format history into a context string
+        let context = history.iter().map(|msg| {
+            format!("{}: {}", msg.role, msg.content)
+        }).collect::<Vec<_>>().join("\n");
+        
+        debug!("Formatted context:\n{}", context);
+        
+        // Create prompt with history context
+        let prompt = if context.is_empty() {
+            content.to_string()
+        } else {
+            format!(
+                "Previous conversation:\n{}\n\nCurrent message: {}",
+                context, content
+            )
+        };
+        
+        debug!("Final prompt to agent:\n{}", prompt);
+
+        // Get response from agent
+        let response = self.agent.prompt(&prompt).await?;
+
+        // Add messages to history
+        self.history_manager.add_message(
+            user_id,
+            ChatMessage {
+                role: "user".to_string(),
+                content: content.to_string(),
+                timestamp: Utc::now().timestamp(),
+            },
+        ).await?;
+
+        self.history_manager.add_message(
+            user_id,
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: response.clone(),
+                timestamp: Utc::now().timestamp(),
+            },
+        ).await?;
+
+        Ok(response)
     }
 }
